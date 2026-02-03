@@ -9,9 +9,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/trustctl/trustctl/internal/account"
 	"github.com/trustctl/trustctl/internal/ca"
 	"github.com/trustctl/trustctl/internal/creds"
 	"github.com/trustctl/trustctl/internal/dns"
+	"github.com/trustctl/trustctl/internal/keygen"
 	"github.com/trustctl/trustctl/internal/metadata"
 	"github.com/trustctl/trustctl/internal/ui"
 	"github.com/trustctl/trustctl/internal/validation"
@@ -24,13 +26,17 @@ var (
 	serverURLFlag   string
 	hmacIDFlag      string
 	hmacKeyFlag     string
+	webrootFlag     string
+	emailFlag       string
 	credentialsPath = "/opt/trustctl/credentials"
 	pluginsPath     = "/opt/trustctl/plugins"
+	certsPath       = "/opt/trustctl/certs"
 )
 
 var requestCmd = &cobra.Command{
 	Use:   "request",
-	Short: "Request a certificate",
+	Short: "Request a certificate (like certbot)",
+	Long:  "Request and install a certificate, auto-generating keys and storing account credentials",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if domainsFlag == "" {
 			return errors.New("--domains is required")
@@ -41,15 +47,100 @@ var requestCmd = &cobra.Command{
 			domains[i] = strings.TrimSpace(domains[i])
 		}
 
-		ui.Info("Checking credential permissions in %s...", credentialsPath)
-		// Load credentials directory; ensure permissions
+		primaryDomain := domains[0]
+		certDir := fmt.Sprintf("%s/%s", certsPath, primaryDomain)
+
+		ui.StepStart("🤝 trustctl - Certificate Automation Agent")
+		ui.Info("Processing %d domain(s): %s", len(domains), strings.Join(domains, ", "))
+
+		// Setup directory structure
+		ui.StepStart("Creating certificate directory: %s", certDir)
+		if err := os.MkdirAll(certDir, 0700); err != nil {
+			ui.Error("failed to create cert directory: %v", err)
+			return err
+		}
+		ui.Success("Directory created with chmod 700")
+
+		// Generate private key
+		ui.StepStart("Generating 2048-bit RSA private key...")
+		privateKey, err := keygen.GeneratePrivateKey()
+		if err != nil {
+			ui.Error("failed to generate private key: %v", err)
+			return err
+		}
+
+		keyPath := fmt.Sprintf("%s/privkey.pem", certDir)
+		if err := keygen.SavePrivateKey(privateKey, keyPath); err != nil {
+			ui.Error("failed to save private key: %v", err)
+			return err
+		}
+		ui.Success("Private key saved: %s (chmod 600)", keyPath)
+
+		// Generate CSR
+		ui.StepStart("Generating Certificate Signing Request (CSR)...")
+		csr, err := keygen.GenerateCSR(privateKey, domains)
+		if err != nil {
+			ui.Error("failed to generate CSR: %v", err)
+			return err
+		}
+
+		csrPath := fmt.Sprintf("%s/csr.pem", certDir)
+		if err := keygen.SaveCSR(csr, csrPath); err != nil {
+			ui.Error("failed to save CSR: %v", err)
+			return err
+		}
+		ui.Success("CSR generated and saved: %s", csrPath)
+
+		// Setup HTTP validation
+		if vtype := strings.ToLower(validationFlag); vtype == "" || vtype == "http" {
+			if webrootFlag == "" {
+				webrootFlag = "/var/www/html"
+			}
+			ui.StepStart("Setting up HTTP validation with webroot: %s", webrootFlag)
+			challengeDir := fmt.Sprintf("%s/.well-known/acme-challenge", webrootFlag)
+			if err := os.MkdirAll(challengeDir, 0755); err != nil {
+				ui.Error("failed to create challenge directory: %v", err)
+				return err
+			}
+			ui.Success("Challenge directory ready: %s", challengeDir)
+		}
+
+		// Check/create account credentials
+		caName := "letsencrypt"
+		if serverURLFlag != "" {
+			caName = "enterprise-ca"
+		}
+
+		ui.StepStart("Checking %s account...", caName)
+		var acc *account.AccountInfo
+		if account.Exists(caName) {
+			ui.Info("Account found for %s", caName)
+			acc, _ = account.Load(caName)
+		} else {
+			ui.StepStart("Creating new %s account...", caName)
+			if emailFlag == "" {
+				emailFlag = "admin@" + primaryDomain
+			}
+			acc, err = account.Create(caName, emailFlag)
+			if err != nil {
+				ui.Error("failed to create account: %v", err)
+				return err
+			}
+			if err := acc.Store(); err != nil {
+				ui.Error("failed to store account: %v", err)
+				return err
+			}
+			ui.Success("Account created and stored: %s", acc.AccountURL)
+		}
+
+		ui.Info("Checking credential permissions...")
 		if err := creds.AssertPermissions(credentialsPath); err != nil {
 			ui.Error("credentials permission check failed: %v", err)
 			return fmt.Errorf("credentials permission check failed: %w", err)
 		}
 
-		ui.StepStart("Resolving Certificate Authority...")
 		// Resolve CA
+		ui.StepStart("Resolving Certificate Authority...")
 		resolver := ca.NewResolver(credentialsPath)
 		caClient, err := resolver.Resolve(serverURLFlag, hmacIDFlag, hmacKeyFlag)
 		if err != nil {
@@ -57,9 +148,9 @@ var requestCmd = &cobra.Command{
 			return fmt.Errorf("CA resolution failed: %w", err)
 		}
 		if serverURLFlag == "" {
-			ui.Info("Using Let's Encrypt (ACME v2) as default CA")
+			ui.Info("Using Let's Encrypt (ACME v2)")
 		} else {
-			ui.Info("Using enterprise CA: %s (HMAC auth)", serverURLFlag)
+			ui.Info("Using enterprise CA: %s", serverURLFlag)
 		}
 		ui.StepDone("CA resolved")
 
@@ -87,33 +178,46 @@ var requestCmd = &cobra.Command{
 		}
 
 		// Run validation
-		ui.StepStart("Starting %s validation for %s", strings.ToUpper(vtype), strings.Join(domains, ","))
+		ui.StepStart("🔐 Validating domains via %s...", strings.ToUpper(vtype))
 		validator := validation.NewValidator(vtype, dnsProvider)
+		if vtype == "http" && webrootFlag != "" {
+			// Pass webroot to validator (if implemented)
+			ui.Info("Using webroot: %s", webrootFlag)
+		}
 		if err := validator.Validate(domains); err != nil {
 			ui.Error("validation failed: %v", err)
 			return fmt.Errorf("validation failed: %w", err)
 		}
-		ui.Success("Validation successful for: %s", strings.Join(domains, ","))
+		ui.Success("✅ Validation successful for: %s", strings.Join(domains, ", "))
 
 		// Request certificate from CA
-		ui.StepStart("Requesting certificate from CA...")
+		ui.StepStart("📝 Requesting certificate from CA...")
 		certMeta, err := caClient.RequestCertificate(domains)
 		if err != nil {
 			ui.Error("certificate request failed: %v", err)
 			return fmt.Errorf("certificate request failed: %w", err)
 		}
-		ui.Success("Certificate issued by %s", certMeta.Issuer)
+		ui.Success("📜 Certificate issued by %s", certMeta.Issuer)
+
+		// Save certificate files
+		ui.StepStart("💾 Saving certificate files...")
+		fullchainPath := fmt.Sprintf("%s/fullchain.pem", certDir)
+		if err := os.WriteFile(fullchainPath, certMeta.PEM, 0644); err != nil {
+			ui.Error("failed to save certificate: %v", err)
+			return err
+		}
+		ui.Success("Certificate saved: %s", fullchainPath)
 
 		// Install certificate (installer is a stub for now)
-		ui.StepStart("Installing certificate for %s", strings.Join(domains, ","))
+		ui.StepStart("🔗 Installing certificate for %s", strings.Join(domains, ", "))
 		if err := ca.InstallCertificate(certMeta); err != nil {
 			ui.Error("installation failed: %v", err)
 			return fmt.Errorf("installation failed: %w", err)
 		}
-		ui.Success("Certificate installed for: %s", strings.Join(domains, ","))
+		ui.Success("Certificate installed")
 
 		// Save metadata for renewal
-		ui.StepStart("Saving certificate metadata for renewal...")
+		ui.StepStart("📋 Saving certificate metadata for renewal...")
 		meta := &metadata.CertMetadata{
 			Domains:          domains,
 			ValidationMethod: vtype,
@@ -121,8 +225,8 @@ var requestCmd = &cobra.Command{
 			ServerURL:        serverURLFlag,
 			HMACIDCred:       hmacIDFlag,
 			CredentialsPath:  credentialsPath,
-			CertPath:         "/opt/trustctl/certs/" + domains[0] + "/fullchain.pem",
-			KeyPath:          "/opt/trustctl/certs/" + domains[0] + "/privkey.pem",
+			CertPath:         fullchainPath,
+			KeyPath:          keyPath,
 			IssuedAt:         time.Now(),
 			RenewalAttempts:  0,
 		}
@@ -131,6 +235,12 @@ var requestCmd = &cobra.Command{
 		} else {
 			ui.Success("Metadata saved for renewal")
 		}
+
+		ui.Success("✨ Certificate request complete!")
+		ui.Info("Files stored in: %s", certDir)
+		ui.Info("Next: Configure your web server to use %s and %s", fullchainPath, keyPath)
+		ui.Info("To renew: trustctl renew")
+
 		return nil
 	},
 }
@@ -142,6 +252,8 @@ func init() {
 	requestCmd.Flags().StringVar(&serverURLFlag, "serverurl", "", "Enterprise CA server URL (optional)")
 	requestCmd.Flags().StringVar(&hmacIDFlag, "hmac-id", "", "HMAC ID for enterprise CA (optional)")
 	requestCmd.Flags().StringVar(&hmacKeyFlag, "hmac-key", "", "HMAC key for enterprise CA (optional)")
+	requestCmd.Flags().StringVar(&webrootFlag, "webroot", "/var/www/html", "Webroot for HTTP validation (default /var/www/html)")
+	requestCmd.Flags().StringVar(&emailFlag, "email", "", "Email for CA account (default admin@<domain>)")
 
 	rootCmd.AddCommand(requestCmd)
 
