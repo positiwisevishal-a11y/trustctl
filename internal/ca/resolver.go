@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/trustctl/trustctl/internal/ui"
 )
 
 // CertificateMeta holds certificate metadata and files locations.
@@ -73,6 +75,16 @@ func InstallCertificate(meta *CertificateMeta) error {
 		return errors.New("nil certificate meta")
 	}
 	// In a real implementation write to /opt/trustctl/certs/<domain>/ with chmod 0700 and owner root.
-	fmt.Printf("install: would install cert for %v issued by %s\n", meta.Domains, meta.Issuer)
+	// Use UI success message instead of plain fmt
+	// avoid printing secret material
+	// NOTE: actual write/atomic replace is not implemented in this scaffold
+	return uiSuccessInstall(meta)
+}
+
+func uiSuccessInstall(meta *CertificateMeta) error {
+	if meta == nil {
+		return errors.New("nil certificate meta")
+	}
+	ui.Success("install: would install cert for %v issued by %s", meta.Domains, meta.Issuer)
 	return nil
 }
